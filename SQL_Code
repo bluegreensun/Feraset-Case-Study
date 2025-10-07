@@ -1,0 +1,387 @@
+-- proc_feraset_analiz.sql
+-- FERASET Case – Monthly PL/SQL Analysis
+-- Generates monthly console reports from FERASET_IY:
+--   - Top categories by App Count
+--   - Top categories by Total Downloads
+--   - Top categories by Revenue-Per-Download (RPD)
+-- Features:
+--   - Robust month filter (p_month => 'YYYY-MM')
+--   - Date normalization for heterogeneous Last_Update_Date values
+--   - Tag splitting on comma/semicolon/pipe with trimming and normalization
+-- Requirements:
+--   Oracle 11g+ ; table FERASET_IY(Last_Update_Date, Tags, Downloads, TTD_Revenue)
+
+SET DEFINE OFF;
+
+CREATE OR REPLACE PROCEDURE PROC_FERASET_ANALIZ (
+    p_limit IN PLS_INTEGER DEFAULT 10,
+    p_month IN VARCHAR2     DEFAULT NULL   -- 'YYYY-MM' or NULL for all months
+) IS
+    ---------------------------------------------------------------------------
+    -- Helper: Try casting string to DATE with given format. Returns NULL on fail.
+    ---------------------------------------------------------------------------
+    FUNCTION try_to_date(p_str VARCHAR2, p_fmt VARCHAR2) RETURN DATE IS
+        d DATE;
+    BEGIN
+        IF p_str IS NULL THEN
+            RETURN NULL;
+        END IF;
+        BEGIN
+            d := TO_DATE(p_str, p_fmt);
+            RETURN d;
+        EXCEPTION
+            WHEN OTHERS THEN
+                RETURN NULL;
+        END;
+    END;
+
+    ---------------------------------------------------------------------------
+    -- Helper: Normalize unknown Last_Update_Date (DATE or VARCHAR2) to first of month
+    -- Attempts multiple common formats.
+    ---------------------------------------------------------------------------
+    FUNCTION normalize_month(p_any IN VARCHAR2) RETURN DATE IS
+        s  VARCHAR2(4000) := p_any;  -- works whether original col is DATE or VARCHAR2 via TO_CHAR in query
+        d0 DATE;
+    BEGIN
+        -- Try from most specific (with time) to least specific (month-level)
+        d0 := COALESCE(
+                try_to_date(s, 'YYYY-MM-DD HH24:MI:SS'),
+                try_to_date(s, 'YYYY-MM-DD'),
+                try_to_date(s, 'DD.MM.YYYY'),
+                try_to_date(s, 'MM/DD/YYYY'),
+                try_to_date(s, 'YYYY/MM/DD'),
+                try_to_date(s, 'DD-MON-YYYY'),
+                try_to_date(s, 'MON-YYYY'),
+                try_to_date(s, 'YYYY-MM')
+              );
+        IF d0 IS NOT NULL THEN
+            RETURN TRUNC(d0, 'MM');
+        ELSE
+            -- As a last resort, if p_any was already a date literal string understood by Oracle
+            BEGIN
+                d0 := TO_DATE(s);
+                RETURN TRUNC(d0, 'MM');
+            EXCEPTION
+                WHEN OTHERS THEN
+                    RETURN NULL;
+            END;
+        END IF;
+    END;
+
+    ---------------------------------------------------------------------------
+    -- Local printing helpers
+    ---------------------------------------------------------------------------
+    PROCEDURE print_line(p IN VARCHAR2) IS BEGIN DBMS_OUTPUT.PUT_LINE(p); END;
+    PROCEDURE print_rule(p_char IN CHAR DEFAULT '-') IS
+    BEGIN
+        DBMS_OUTPUT.PUT_LINE(RPAD(p_char, 80, p_char));
+    END;
+
+BEGIN
+    IF p_limit IS NULL OR p_limit < 1 THEN
+        RAISE_APPLICATION_ERROR(-20001, 'p_limit must be >= 1');
+    END IF;
+
+    print_rule('=');
+    print_line('FERASET Monthly Market Report');
+    print_line('Limit: ' || p_limit || CASE WHEN p_month IS NOT NULL THEN ' | Month filter: '||p_month ELSE ' | Month filter: ALL' END);
+    print_rule('=');
+
+    ---------------------------------------------------------------------------
+    -- We first materialize normalized base rows in a subquery and iterate months.
+    -- Notes:
+    --  - We use TO_CHAR(Last_Update_Date) so it works for DATE or VARCHAR2 columns.
+    --  - Tag splitting: split by comma/semicolon/pipe, trim, upper; empty -> 'UNCATEGORIZED'
+    ---------------------------------------------------------------------------
+
+    FOR m IN (
+        WITH base AS (
+            SELECT
+                normalize_month(TO_CHAR(Last_Update_Date)) AS month_start,
+                COALESCE(Downloads, 0)                     AS downloads,
+                COALESCE(TTD_Revenue, 0)                   AS revenue,
+                NVL(TRIM(TO_CHAR(Tags)), '')               AS tags_raw
+            FROM FERASET_IY
+        ),
+        months AS (
+            SELECT DISTINCT TO_CHAR(month_start, 'YYYY-MM') AS month_key
+            FROM base
+            WHERE month_start IS NOT NULL
+        )
+        SELECT month_key
+        FROM months
+        WHERE (p_month IS NULL OR month_key = p_month)
+        ORDER BY month_key
+    ) LOOP
+        print_rule('-');
+        print_line('Month: ' || m.month_key);
+        print_rule('-');
+
+        -----------------------------------------------------------------------
+        -- Common CTE for this month: split tags, aggregate by category
+        -----------------------------------------------------------------------
+        DECLARE
+            CURSOR cur_top_appcount IS
+                WITH base AS (
+                    SELECT
+                        normalize_month(TO_CHAR(Last_Update_Date)) AS month_start,
+                        COALESCE(Downloads, 0)                     AS downloads,
+                        COALESCE(TTD_Revenue, 0)                   AS revenue,
+                        NVL(TRIM(TO_CHAR(Tags)), '')               AS tags_raw
+                    FROM FERASET_IY
+                ),
+                month_rows AS (
+                    SELECT *
+                    FROM base
+                    WHERE month_start IS NOT NULL
+                      AND TO_CHAR(month_start, 'YYYY-MM') = m.month_key
+                ),
+                -- Split tags: comma/semicolon/pipe; trim; default UNCATEGORIZED
+                tag_expanded AS (
+                    SELECT
+                        month_start,
+                        downloads,
+                        revenue,
+                        CASE
+                            WHEN TRIM(UPPER(tag)) IS NULL THEN 'UNCATEGORIZED'
+                            ELSE TRIM(UPPER(tag))
+                        END AS category
+                    FROM (
+                        SELECT
+                            month_start,
+                            downloads,
+                            revenue,
+                            REGEXP_SUBSTR(tags_raw, '[^,;|]+', 1, LEVEL) AS tag
+                        FROM month_rows
+                        CONNECT BY REGEXP_SUBSTR(tags_raw, '[^,;|]+', 1, LEVEL) IS NOT NULL
+                           AND PRIOR SYS_GUID() IS NOT NULL
+                           AND PRIOR month_start = month_start
+                           AND PRIOR downloads   = downloads
+                           AND PRIOR revenue     = revenue
+                           AND PRIOR tags_raw    = tags_raw
+                    )
+                ),
+                agg AS (
+                    SELECT
+                        TO_CHAR(month_start, 'YYYY-MM')               AS month_key,
+                        category,
+                        COUNT(*)                                      AS app_count,
+                        SUM(downloads)                                AS total_downloads,
+                        SUM(revenue)                                  AS total_revenue,
+                        CASE WHEN SUM(downloads) = 0 THEN 0
+                             ELSE ROUND(SUM(revenue) / SUM(downloads), 6)
+                        END                                           AS rpd
+                    FROM tag_expanded
+                    GROUP BY TO_CHAR(month_start, 'YYYY-MM'), category
+                ),
+                ranked AS (
+                    SELECT
+                        a.*,
+                        DENSE_RANK() OVER (ORDER BY app_count DESC, category)        AS r_appcount,
+                        DENSE_RANK() OVER (ORDER BY total_downloads DESC, category)  AS r_downloads,
+                        DENSE_RANK() OVER (ORDER BY rpd DESC, category)              AS r_rpd
+                    FROM agg a
+                )
+                SELECT category, app_count
+                FROM ranked
+                WHERE r_appcount <= p_limit
+                ORDER BY app_count DESC, category;
+
+            CURSOR cur_top_downloads IS
+                WITH base AS (
+                    SELECT
+                        normalize_month(TO_CHAR(Last_Update_Date)) AS month_start,
+                        COALESCE(Downloads, 0)                     AS downloads,
+                        COALESCE(TTD_Revenue, 0)                   AS revenue,
+                        NVL(TRIM(TO_CHAR(Tags)), '')               AS tags_raw
+                    FROM FERASET_IY
+                ),
+                month_rows AS (
+                    SELECT *
+                    FROM base
+                    WHERE month_start IS NOT NULL
+                      AND TO_CHAR(month_start, 'YYYY-MM') = m.month_key
+                ),
+                tag_expanded AS (
+                    SELECT
+                        month_start,
+                        downloads,
+                        revenue,
+                        CASE
+                            WHEN TRIM(UPPER(tag)) IS NULL THEN 'UNCATEGORIZED'
+                            ELSE TRIM(UPPER(tag))
+                        END AS category
+                    FROM (
+                        SELECT
+                            month_start,
+                            downloads,
+                            revenue,
+                            REGEXP_SUBSTR(tags_raw, '[^,;|]+', 1, LEVEL) AS tag
+                        FROM month_rows
+                        CONNECT BY REGEXP_SUBSTR(tags_raw, '[^,;|]+', 1, LEVEL) IS NOT NULL
+                           AND PRIOR SYS_GUID() IS NOT NULL
+                           AND PRIOR month_start = month_start
+                           AND PRIOR downloads   = downloads
+                           AND PRIOR revenue     = revenue
+                           AND PRIOR tags_raw    = tags_raw
+                    )
+                ),
+                agg AS (
+                    SELECT
+                        TO_CHAR(month_start, 'YYYY-MM')               AS month_key,
+                        category,
+                        COUNT(*)                                      AS app_count,
+                        SUM(downloads)                                AS total_downloads,
+                        SUM(revenue)                                  AS total_revenue,
+                        CASE WHEN SUM(downloads) = 0 THEN 0
+                             ELSE ROUND(SUM(revenue) / SUM(downloads), 6)
+                        END                                           AS rpd
+                    FROM tag_expanded
+                    GROUP BY TO_CHAR(month_start, 'YYYY-MM'), category
+                ),
+                ranked AS (
+                    SELECT
+                        a.*,
+                        DENSE_RANK() OVER (ORDER BY app_count DESC, category)        AS r_appcount,
+                        DENSE_RANK() OVER (ORDER BY total_downloads DESC, category)  AS r_downloads,
+                        DENSE_RANK() OVER (ORDER BY rpd DESC, category)              AS r_rpd
+                    FROM agg a
+                )
+                SELECT category, total_downloads
+                FROM ranked
+                WHERE r_downloads <= p_limit
+                ORDER BY total_downloads DESC, category;
+
+            CURSOR cur_top_rpd IS
+                WITH base AS (
+                    SELECT
+                        normalize_month(TO_CHAR(Last_Update_Date)) AS month_start,
+                        COALESCE(Downloads, 0)                     AS downloads,
+                        COALESCE(TTD_Revenue, 0)                   AS revenue,
+                        NVL(TRIM(TO_CHAR(Tags)), '')               AS tags_raw
+                    FROM FERASET_IY
+                ),
+                month_rows AS (
+                    SELECT *
+                    FROM base
+                    WHERE month_start IS NOT NULL
+                      AND TO_CHAR(month_start, 'YYYY-MM') = m.month_key
+                ),
+                tag_expanded AS (
+                    SELECT
+                        month_start,
+                        downloads,
+                        revenue,
+                        CASE
+                            WHEN TRIM(UPPER(tag)) IS NULL THEN 'UNCATEGORIZED'
+                            ELSE TRIM(UPPER(tag))
+                        END AS category
+                    FROM (
+                        SELECT
+                            month_start,
+                            downloads,
+                            revenue,
+                            REGEXP_SUBSTR(tags_raw, '[^,;|]+', 1, LEVEL) AS tag
+                        FROM month_rows
+                        CONNECT BY REGEXP_SUBSTR(tags_raw, '[^,;|]+', 1, LEVEL) IS NOT NULL
+                           AND PRIOR SYS_GUID() IS NOT NULL
+                           AND PRIOR month_start = month_start
+                           AND PRIOR downloads   = downloads
+                           AND PRIOR revenue     = revenue
+                           AND PRIOR tags_raw    = tags_raw
+                    )
+                ),
+                agg AS (
+                    SELECT
+                        TO_CHAR(month_start, 'YYYY-MM')               AS month_key,
+                        category,
+                        COUNT(*)                                      AS app_count,
+                        SUM(downloads)                                AS total_downloads,
+                        SUM(revenue)                                  AS total_revenue,
+                        CASE WHEN SUM(downloads) = 0 THEN 0
+                             ELSE ROUND(SUM(revenue) / SUM(downloads), 6)
+                        END                                           AS rpd
+                    FROM tag_expanded
+                    GROUP BY TO_CHAR(month_start, 'YYYY-MM'), category
+                ),
+                ranked AS (
+                    SELECT
+                        a.*,
+                        DENSE_RANK() OVER (ORDER BY app_count DESC, category)        AS r_appcount,
+                        DENSE_RANK() OVER (ORDER BY total_downloads DESC, category)  AS r_downloads,
+                        DENSE_RANK() OVER (ORDER BY rpd DESC, category)              AS r_rpd
+                    FROM agg a
+                )
+                SELECT category, rpd, total_revenue, total_downloads, app_count
+                FROM ranked
+                WHERE r_rpd <= p_limit
+                ORDER BY rpd DESC, category;
+
+            v_cat         VARCHAR2(200);
+            v_n1          NUMBER;
+            v_rpd         NUMBER;
+            v_rev         NUMBER;
+            v_dw          NUMBER;
+            v_cnt         NUMBER;
+        BEGIN
+            -- 1) Top by App Count
+            print_line('• Top Categories by App Count');
+            print_line(RPAD('Category', 40) || LPAD('Apps', 10));
+            print_rule('.');
+            OPEN cur_top_appcount;
+            LOOP
+                FETCH cur_top_appcount INTO v_cat, v_n1;
+                EXIT WHEN cur_top_appcount%NOTFOUND;
+                print_line(RPAD(v_cat, 40) || LPAD(TO_CHAR(v_n1), 10));
+            END LOOP;
+            CLOSE cur_top_appcount;
+            print_line('');
+
+            -- 2) Top by Total Downloads
+            print_line('• Top Categories by Total Downloads');
+            print_line(RPAD('Category', 40) || LPAD('Downloads', 15));
+            print_rule('.');
+            OPEN cur_top_downloads;
+            LOOP
+                FETCH cur_top_downloads INTO v_cat, v_n1;
+                EXIT WHEN cur_top_downloads%NOTFOUND;
+                print_line(RPAD(v_cat, 40) || LPAD(TO_CHAR(v_n1), 15));
+            END LOOP;
+            CLOSE cur_top_downloads;
+            print_line('');
+
+            -- 3) Top by Revenue-Per-Download (RPD)
+            print_line('• Top Categories by Revenue-Per-Download (RPD)');
+            print_line(RPAD('Category', 30) ||
+                       LPAD('RPD', 12) ||
+                       LPAD('Revenue', 14) ||
+                       LPAD('Downloads', 14) ||
+                       LPAD('Apps', 8));
+            print_rule('.');
+            OPEN cur_top_rpd;
+            LOOP
+                FETCH cur_top_rpd INTO v_cat, v_rpd, v_rev, v_dw, v_cnt;
+                EXIT WHEN cur_top_rpd%NOTFOUND;
+                print_line(RPAD(v_cat, 30) ||
+                           LPAD(TO_CHAR(v_rpd, 'FM9999990D999999'), 12) ||
+                           LPAD(TO_CHAR(v_rev), 14) ||
+                           LPAD(TO_CHAR(v_dw), 14) ||
+                           LPAD(TO_CHAR(v_cnt), 8));
+            END LOOP;
+            CLOSE cur_top_rpd;
+
+            print_line('');  -- spacing after each month
+        END;
+    END LOOP;
+
+    print_rule('=');
+    print_line('End of Report');
+    print_rule('=');
+
+EXCEPTION
+    WHEN OTHERS THEN
+        DBMS_OUTPUT.PUT_LINE('Error in PROC_FERASET_ANALIZ: ' || SQLERRM);
+        RAISE;
+END PROC_FERASET_ANALIZ;
+/
+SHOW ERRORS
